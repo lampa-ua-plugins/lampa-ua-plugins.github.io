@@ -616,8 +616,12 @@
           Lampa.Loading.stop();
           if (cancelled) return;
           if (movie.id) Lampa.Favorite.add('history', movie, 100);
-          item.playlist = playlist;
-          Lampa.Player.play(item);
+          // копія з плейлистом: сама серія лежить у playlist, і item.playlist = playlist дав би цикл —
+          // зовнішній плеєр Android робить JSON.stringify(data) і падає («Converting circular structure to JSON»)
+          var data = {};
+          for (var k in item) data[k] = item[k];
+          data.playlist = playlist;
+          Lampa.Player.play(data);
           Lampa.Player.playlist(playlist);
         }, function (e) {
           Lampa.Loading.stop();
