@@ -8,7 +8,7 @@
 
   if (window.dawn_plugin) return;
 
-  var VERSION = '1.0.1';
+  var VERSION = '1.0.2';
 
   var PROXY = 'https://dawn.levende.xyz'; // worker/index.js
   var net = window.Lampa && Lampa.Reguest ? new Lampa.Reguest() : null;
@@ -361,7 +361,7 @@
         var still = (te && te.still_path) || movie.backdrop_path;
         var item = {
           thumbnail: still ? Lampa.TMDB.image('t/p/w300' + still) : '',
-          title: playTitle(te, ep),
+          title: playTitle(te, te ? te.episode_number : ep.number),
           timeline: Lampa.Timeline.view(Lampa.Utils.hash(key)),
           season: te ? te.season_number : 0,
           episode: te ? te.episode_number : 0,
@@ -382,12 +382,11 @@
         return item;
       });
 
-      // Як у інших плагінах: «Серіал / Сезон 4 / 17. Назва серії»; без TMDB — тайтл каталогу і його номер серії
-      function playTitle(te, ep) {
+      // Як в online.js: назва серії з TMDB, інакше «Серія N»; серіал і сезон Lampa знає з картки й season/episode.
+      // Спільна для плеєра і картки серії в списку
+      function playTitle(te, number) {
         if (film) return name;
-        var base = movie.name || movie.title || name;
-        if (!te) return base + ' / ' + name + ' / ' + tr('torrent_serial_episode') + ' ' + ep.number;
-        return base + ' / ' + tr('torrent_serial_season') + ' ' + te.season_number + ' / ' + te.episode_number + (te.name ? '. ' + te.name : '');
+        return (te && te.name) || tr('torrent_serial_episode') + ' ' + number;
       }
 
       // Потік і таймкоди пропуску (opening/ending) одним запитом; таймкоди → segments.skip плеєра Lampa
@@ -453,7 +452,7 @@
         var left = item || !te ? 0 : Math.round(days(te.air_date) - Date.now() / 864e5);
 
         var html = Lampa.Template.get('dawn_full', {
-          title: film ? name : (te && te.name) || tr('torrent_serial_episode') + ' ' + number,
+          title: playTitle(te, number),
           time: te && te.runtime ? Lampa.Utils.secondsToTime(te.runtime * 60, true) : '',
           info: info.map(function (line) { return '<span>' + line + '</span>'; }).join('<span class="online-prestige-split">●</span>'),
           quality: left > 0 ? tr('full_episode_days_left') + ': ' + left : ''
