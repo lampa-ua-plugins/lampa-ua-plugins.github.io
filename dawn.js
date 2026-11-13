@@ -1,25 +1,23 @@
 // Dawn для Lampa: кнопка «Dawn» у картці аніме → екран у стилі online-плагінів (сезон, озвучка, серії).
-// Тайтли: IMDb → arm → MAL-id → каталог; запасний шлях — пошук за назвою з перевіркою IMDb.
-// Потік: плеєр Dawn — PoW → сесія → AES-GCM-відповідь (ключ = HMAC("dawn:aurora:v1", session)).
+// Уся мережа — через воркер dawn.levende.xyz (worker/index.js): пошук тайтлів (IMDb → arm → MAL-id → каталог),
+// PoW, сесія, розшифровка. ТВ робить лише прості GET на один домен, як з online.js.
 // Серії прив'язуються до TMDB за датою виходу → кадри, назви і прогрес як у Lampa.
-// ES5 під цілі Lampa (Chrome 38, Safari 7): без fetch, Math.clz32, TextEncoder поза WebCrypto; Promise — поліфіл Lampa.
+// ES5 під цілі Lampa (Chrome 38, Safari 7): без fetch; Promise — поліфіл Lampa.
 (function () {
   'use strict';
 
   if (window.dawn_plugin) return;
 
-  var API = 'https://api.mikai.me/v1';
-  var DAWN = API + '/player/dawn';
-  var ARM = 'https://arm.haglund.dev/api/v2/imdb?id=';
+  var VERSION = '1.0.0';
+
+  var PROXY = 'https://dawn.levende.xyz'; // worker/index.js
   var net = window.Lampa && Lampa.Reguest ? new Lampa.Reguest() : null;
-  var session = null;
-  var pending = null;
-  var libReady = null;
+  var inner = null; // плейлист вбудованого плеєра до data.playlist з посиланнями на воркер
 
   // Lampa.Reguest: silent-запити йдуть паралельно; fetch — лише поза Lampa (test.mjs)
-  function getJson(url, body, headers) {
+  function getJson(url) {
     if (!net) {
-      return fetch(url, body ? { method: 'POST', headers: headers, body: body } : { headers: headers }).then(function (r) {
+      return fetch(url).then(function (r) {
         if (r.ok) return r.json();
         var e = new Error('HTTP ' + r.status);
         e.status = r.status;
@@ -31,208 +29,24 @@
         var e = new Error(net.errorDecode(x, ''));
         e.status = x && x.status;
         fail(e);
-      }, body || false, headers ? { headers: headers } : undefined);
-    });
-  }
-
-  function b64(s) {
-    var bin = atob(s), a = new Uint8Array(bin.length);
-    for (var i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i);
-    return a;
-  }
-
-  function zeroBits(buf) {
-    var b = new Uint8Array(buf), n = 0;
-    for (var i = 0; i < b.length; i++, n += 8) {
-      if (b[i]) {
-        for (var bit = 128; !(b[i] & bit); bit >>= 1) n++;
-        return n;
-      }
-    }
-    return n;
-  }
-
-  // crypto.subtle є лише в secure context: Lampa по http:// або старий WebView його не мають → node-forge з CDN.
-  // Методи можуть повертати значення або Promise — виклики обгорнуті в Promise.resolve
-  function webCrypto(subtle) {
-    var enc = new TextEncoder();
-    return {
-      sha256: function (s) { return subtle.digest('SHA-256', enc.encode(s)); },
-      aesKey: function (session) {
-        return subtle.importKey('raw', enc.encode('dawn:aurora:v1'), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
-          .then(function (k) { return subtle.sign('HMAC', k, enc.encode(session)); })
-          .then(function (raw) { return subtle.importKey('raw', raw, 'AES-GCM', false, ['decrypt']); });
-      },
-      decrypt: function (key, n, d) {
-        return subtle.decrypt({ name: 'AES-GCM', iv: b64(n) }, key, b64(d)).then(function (buf) {
-          return new TextDecoder().decode(buf);
-        });
-      }
-    };
-  }
-
-  function forgeCrypto(forge) {
-    return {
-      sha256: function (s) { return b64(btoa(forge.md.sha256.create().update(s, 'utf8').digest().getBytes())); },
-      aesKey: function (session) {
-        var h = forge.hmac.create();
-        h.start('sha256', 'dawn:aurora:v1');
-        h.update(session);
-        return h.digest().getBytes();
-      },
-      // d = шифротекст + 16 байт тегу (формат WebCrypto)
-      decrypt: function (key, n, d) {
-        var bin = atob(d), c = forge.cipher.createDecipher('AES-GCM', key);
-        c.start({ iv: atob(n), tag: forge.util.createBuffer(bin.slice(-16)) });
-        c.update(forge.util.createBuffer(bin.slice(0, -16)));
-        if (!c.finish()) throw new Error('AES-GCM: невірний тег');
-        return forge.util.decodeUtf8(c.output.getBytes());
-      }
-    };
-  }
-
-  function lib() {
-    if (window.crypto && window.crypto.subtle) return Promise.resolve(webCrypto(window.crypto.subtle));
-    if (window.forge) return Promise.resolve(forgeCrypto(window.forge));
-    return libReady || (libReady = new Promise(function (ok, fail) {
-      var s = document.createElement('script');
-      s.src = 'https://cdn.jsdelivr.net/npm/node-forge@1.3.1/dist/forge.min.js';
-      s.onload = function () { ok(forgeCrypto(window.forge)); };
-      s.onerror = function () {
-        libReady = null;
-        fail(new Error('немає WebCrypto і не завантажився node-forge'));
-      };
-      document.head.appendChild(s);
-    }));
-  }
-
-  // ponytail: один sha256 на nonce (~4k спроб при difficulty 15, <1 с); вбудований SHA-256, якщо складність зросте
-  function solve(c, challenge, difficulty, nonce) {
-    return Promise.resolve(c.sha256(challenge + nonce)).then(function (h) {
-      return zeroBits(h) >= difficulty ? String(nonce) : solve(c, challenge, difficulty, nonce + 1);
-    });
-  }
-
-  function newSession() {
-    return lib().then(function (c) {
-      return getJson(DAWN + '/challenge').then(function (j) {
-        var ch = j.result;
-        return solve(c, ch.challenge, ch.difficulty, 0).then(function (nonce) {
-          return getJson(DAWN + '/session', JSON.stringify({ challenge: ch.challenge, nonce: nonce }), { 'Content-Type': 'application/json' });
-        });
-      }).then(function (j) {
-        var s = j.result;
-        return Promise.resolve(c.aesKey(s.session)).then(function (key) {
-          return { token: s.session, key: key, crypto: c, exp: Date.now() + s.expiresIn * 1000 - 60000 };
-        });
       });
     });
   }
 
-  // одна сесія на всі паралельні запити
-  function getSession() {
-    if (session && Date.now() < session.exp) return Promise.resolve(session);
-    return pending || (pending = newSession().then(function (s) {
-      pending = null;
-      return (session = s);
-    }, function (e) {
-      pending = null;
-      throw e;
-    }));
-  }
-
-  function dawnOnce(path) {
-    return getSession().then(function (s) {
-      return getJson(DAWN + path, null, { 'X-Dawn-Session': s.token }).then(function (j) {
-        return s.crypto.decrypt(s.key, j.result.n, j.result.d);
-      });
-    }).then(JSON.parse);
-  }
-
-  // Сесію відхилено (403) → нова PoW і один повтор, як на сайті
   function dawn(path) {
-    return dawnOnce(path).catch(function (e) {
-      if (e.status !== 403) throw e;
-      session = null;
-      return dawnOnce(path);
-    });
+    return getJson(PROXY + path);
   }
 
-  function search(name) {
-    return getJson(API + '/anime/search?name=' + encodeURIComponent(name)).then(function (j) {
-      return j.result || [];
-    }, function () {
-      return [];
-    });
-  }
-
-  function uniq(lists) {
-    var seen = {}, found = [];
-    lists.forEach(function (l) {
-      l.forEach(function (a) {
-        if (!seen[a.id]) found.push(seen[a.id] = a);
-      });
-    });
-    return found;
-  }
-
-  // arm: IMDb → MAL-id кожного сезону/OVA; каталог шукає числовий name як MAL-id і віддає externalLinks для перевірки
-  function byArm(imdb) {
-    return getJson(ARM + encodeURIComponent(imdb)).then(function (entries) {
-      var mals = (entries || []).map(function (e) { return e.myanimelist; }).filter(function (m, i, a) {
-        return m && a.indexOf(m) === i;
-      });
-      return Promise.all(mals.map(function (mal) {
-        return search(String(mal)).then(function (list) {
-          return list.filter(function (a) { return (a.externalLinks || {}).malId === mal; });
-        });
-      }));
-    }).then(uniq, function () {
-      return [];
-    });
-  }
-
-  function findTitles(movie) {
-    var names = [movie.original_name || movie.original_title, movie.name || movie.title].filter(function (n, i, a) {
+  // Запит тайтлів: оригінальна й локальна назви, IMDb, рік і тип — воркер шукає і фільтрує сам
+  function titlesQuery(movie) {
+    var q = [movie.original_name || movie.original_title, movie.name || movie.title].filter(function (n, i, a) {
       return n && a.indexOf(n) === i;
-    });
-
-    // arm і пошук за назвою стартують паралельно; назва — запасний шлях, коли arm тайтл не знає
-    var byName = Promise.all(names.map(search)).then(uniq);
-    var armed = movie.imdb_id ? byArm(movie.imdb_id) : Promise.resolve([]);
-
-    return armed.then(function (found) {
-      return found.length ? found : byName.then(movie.imdb_id ? verifyImdb : near);
-    }).then(function (list) {
-      return list.sort(function (a, b) {
-        // анонси (year 0, startDate "0001-01-01") — в кінець
-        return (a.year ? a.startDate || '' : '9999').localeCompare(b.year ? b.startDate || '' : '9999');
-      });
-    });
-
-    // пошук за назвою віддає порожні externalLinks — вони є лише в повній картці
-    function verifyImdb(found) {
-      return Promise.all(found.slice(0, 10).map(function (a) {
-        return getJson(API + '/anime/' + a.id).then(function (j) {
-          return (j.result.externalLinks || {}).imdbId === movie.imdb_id ? a : null;
-        }, function () {
-          return null;
-        });
-      })).then(function (matched) {
-        matched = matched.filter(Boolean);
-        return matched.length ? matched : near(found);
-      });
-    }
-
-    // IMDb нічого не підтвердив → нечіткий пошук каталогу віддає все підряд («Остання атака» — 23 тайтли);
-    // лишаються близькі за роком (±1) і типом: фільм ↔ не-ТБ, серіал ↔ не-фільм
-    function near(found) {
-      var year = parseInt((movie.first_air_date || movie.release_date || '').slice(0, 4), 10);
-      if (!year) return found;
-      return found.filter(function (a) {
-        return Math.abs(a.year - year) <= 1 && (movie.name ? a.format !== 'movie' : a.format !== 'tv');
-      });
-    }
+    }).map(function (n) { return 'name=' + encodeURIComponent(n); });
+    var year = parseInt((movie.first_air_date || movie.release_date || '').slice(0, 4), 10);
+    if (movie.imdb_id) q.push('imdb=' + encodeURIComponent(movie.imdb_id));
+    if (year) q.push('year=' + year);
+    if (movie.name) q.push('tv=1');
+    return '/titles?' + q.join('&');
   }
 
   var FORMATS = { tv: 'ТБ', movie: 'Фільм', ova: 'OVA', ona: 'ONA', special: 'Спешл' };
@@ -365,17 +179,6 @@
       });
     }
 
-    // Релізи Dawn тайтла (кеш у rels); 404 — у Dawn тайтла нема
-    function releasesOf(a) {
-      if (rels[a.id]) return Promise.resolve(rels[a.id]);
-      return dawn('/v2/anime/' + a.id).then(function (d) {
-        return (rels[a.id] = (d.releases || []).filter(function (r) { return r.episodes && r.episodes.length; }));
-      }, function (e) {
-        if (e.status === 404) return (rels[a.id] = []);
-        throw e;
-      });
-    }
-
     function minus() {
       scroll.minus(window.innerWidth > 580 ? false : files.render().find('.files__left'));
     }
@@ -426,25 +229,26 @@
       scroll.append(filter.render());
       this.loading(true);
 
-      // TMDB, пошук і релізи Dawn усіх тайтлів — паралельно (сесія PoW одна на всі запити)
-      var eps = tmdbEpisodes();
-      findTitles(object.clarification ? { name: object.search } : movie).then(function (list) {
-        return Promise.all([eps].concat(list.map(function (a) {
-          return releasesOf(a).catch(function () { return null; });
-        }))).then(function (res) {
-          if (!alive) return;
-          if (!list.length) return self.empty('На запит (' + (object.search || card_key) + ') нічого не знайдено');
-          // лише тайтли з серіями в Dawn; помилка мережі (null) — тайтл лишається
-          titles = list.filter(function (a, i) { return !res[i + 1] || res[i + 1].length; });
-          if (!titles.length) return self.empty('У плеєрі Dawn немає серій: ' + list.map(label).join(', '));
-          // посезонні пункти без жодної серії в жодній озвучці (One Piece S2–S11) не показуємо
-          entries = entriesOf(titles, res[0]).filter(function (en) {
-            var r = rels[en.anime.id];
-            return !en.part || !r || r.some(function (rel) { return here(en, rel).length; });
-          });
-          Lampa.Arrays.extend(choice, Lampa.Storage.cache('dawn_choice', 500, {})[movie.id] || {}, true);
-          load();
+      // TMDB і воркер (тайтли разом із релізами Dawn — один запит) — паралельно
+      var query = titlesQuery(object.clarification ? { name: object.search } : movie);
+      Promise.all([tmdbEpisodes(), dawn(query)]).then(function (res) {
+        if (!alive) return;
+        // воркер віддає лише тайтли з серіями в Dawn, разом із релізами
+        titles = res[1].titles || [];
+        titles.forEach(function (a) {
+          rels[a.id] = a.releases;
         });
+        if (!titles.length) {
+          var empty = res[1].empty || [];
+          return self.empty(empty.length ? 'У плеєрі Dawn немає серій: ' + empty.join(', ') : 'На запит (' + (object.search || card_key) + ') нічого не знайдено');
+        }
+        // посезонні пункти без жодної серії в жодній озвучці (One Piece S2–S11) не показуємо
+        entries = entriesOf(titles, res[0]).filter(function (en) {
+          var r = rels[en.anime.id];
+          return !en.part || r.some(function (rel) { return here(en, rel).length; });
+        });
+        Lampa.Arrays.extend(choice, Lampa.Storage.cache('dawn_choice', 500, {})[movie.id] || {}, true);
+        load();
       }).catch(fail);
 
       return this.render();
@@ -468,25 +272,20 @@
       if (saved >= 0) choice.season = saved;
       if (!entries[choice.season]) choice.season = 0;
       var entry = entries[choice.season];
+      var list = rels[entry.anime.id];
 
       self.reset();
-      self.loading(true);
+      // у фільтрі всі озвучки тайтла; запам'ятована, якої нема в цьому сезоні, не обирається (але й не забувається)
+      var voices = list.map(function (r) { return r.team.name + (r.isSubs ? ' (субтитри)' : ''); });
+      var mine = list.map(function (r) { return here(entry, r); });
+      var v = voices.indexOf(choice.voice_name);
+      if (!mine[v] || !mine[v].length) v = mine[choice.voice] && mine[choice.voice].length ? choice.voice : mine.map(function (m) { return m.length > 0; }).indexOf(true);
+      choice.voice = Math.max(0, v);
 
-      releasesOf(entry.anime).then(function (list) {
-        if (!alive) return;
-        // у фільтрі всі озвучки тайтла; запам'ятована, якої нема в цьому сезоні, не обирається (але й не забувається)
-        var voices = list.map(function (r) { return r.team.name + (r.isSubs ? ' (субтитри)' : ''); });
-        var mine = list.map(function (r) { return here(entry, r); });
-        var v = voices.indexOf(choice.voice_name);
-        if (!mine[v] || !mine[v].length) v = mine[choice.voice] && mine[choice.voice].length ? choice.voice : mine.map(function (m) { return m.length > 0; }).indexOf(true);
-        choice.voice = Math.max(0, v);
-
-        setFilter(voices.map(function (title, i) {
-          return { title: title, subtitle: mine[i].length ? mine[i].length + ' сер. у сезоні' : 'немає в цьому сезоні' };
-        }));
-        if (!list.length) return self.empty('У плеєрі Dawn немає серій');
-        draw(entry, mine[choice.voice], voices[choice.voice]);
-      }).catch(fail);
+      setFilter(voices.map(function (title, i) {
+        return { title: title, subtitle: mine[i].length ? mine[i].length + ' сер. у сезоні' : 'немає в цьому сезоні' };
+      }));
+      draw(entry, mine[choice.voice], voices[choice.voice]);
     }
 
     // Той самий ключ, що в Lampa (timeline.js, episode.js): «:» між сезоном > 10 і серією
@@ -588,21 +387,13 @@
         return base + ' / ' + tr('torrent_serial_season') + ' ' + te.season_number + ' / ' + te.episode_number + (te.name ? '. ' + te.name : '');
       }
 
-      // Потік і таймкоди пропуску (opening/ending) паралельно; таймкоди → segments.skip плеєра Lampa
-      // (пропуск або кнопка — за налаштуванням «Пропуск» у Lampa). Без таймкодів серія все одно грає
+      // Потік і таймкоди пропуску (opening/ending) одним запитом; таймкоди → segments.skip плеєра Lampa
+      // (пропуск або кнопка — за налаштуванням «Пропуск» у Lampa)
       function resolve(item) {
         if (typeof item.url === 'string') return Promise.resolve(item.url);
-        var path = anime.id + '/' + item.ep.video;
-        var skips = getJson(DAWN + '/skips/' + path).then(function (j) {
-          return (j.result || []).filter(function (s) { return s.endSec > s.startSec; }).map(function (s) {
-            return { start: s.startSec, end: s.endSec };
-          });
-        }, function () {
-          return [];
-        });
-        return Promise.all([dawn('/v2/video/' + path), skips]).then(function (r) {
-          if (r[1].length) item.segments = { skip: r[1] };
-          return (item.url = r[0].hls);
+        return dawn('/v2/video/' + anime.id + '/' + item.ep.video).then(function (v) {
+          if (v.skips && v.skips.length) item.segments = { skip: v.skips };
+          return (item.url = v.hls);
         });
       }
 
@@ -620,7 +411,16 @@
           // зовнішній плеєр Android робить JSON.stringify(data) і падає («Converting circular structure to JSON»)
           var data = {};
           for (var k in item) data[k] = item[k];
-          data.playlist = playlist;
+          // зовнішній плеєр бере data.playlist і відкидає пункти з url-функцією (player.js) → ще не відкриті серії
+          // йдуть посиланнями на воркер, що резолвить серію редиректом (.m3u8 — плеєри й Lampa впізнають HLS за URL);
+          // вбудований отримає playlist нижче
+          data.playlist = playlist.map(function (it) {
+            var copy = {};
+            for (var k in it) copy[k] = it[k];
+            if (typeof it.url !== 'string') copy.url = PROXY + '/' + anime.id + '/' + it.ep.video + '.m3u8';
+            return copy;
+          });
+          inner = { proxy: data.playlist, list: playlist };
           Lampa.Player.play(data);
           Lampa.Player.playlist(playlist);
         }, function (e) {
@@ -896,7 +696,7 @@
 
     Lampa.Manifest.plugins = {
       type: 'video',
-      version: '1.0.0',
+      version: VERSION,
       name: 'Dawn',
       description: 'Аніме з українською озвучкою',
       component: 'dawn',
@@ -905,6 +705,12 @@
       },
       onContextLauch: push
     };
+
+    // вбудований плеер бере плейлист з data.playlist уже після Preroll (start) — повертаємо йому серії з url-функцією,
+    // щоб наступні серії резолвились напряму, з таймкодами пропуску (слухач Playlist зареєстрований раніше)
+    Lampa.Player.listener.follow('start', function (d) {
+      if (inner && d.playlist === inner.proxy) Lampa.Player.playlist(inner.list);
+    });
 
     Lampa.Listener.follow('full', function (e) {
       if (e.type == 'complite') addButton(e.object.activity.render().find('.view--torrent'), e.data.movie);
@@ -916,7 +722,7 @@
     } catch (e) {}
   }
 
-  window.dawn_plugin = { findTitles: findTitles, dawn: dawn, locate: locate, titleRange: titleRange, entriesOf: entriesOf, zeroBits: zeroBits };
+  window.dawn_plugin = { version: VERSION, titlesQuery: titlesQuery, dawn: dawn, locate: locate, titleRange: titleRange, entriesOf: entriesOf };
 
   if (window.appready) startPlugin();
   else Lampa.Listener.follow('app', function (e) {
